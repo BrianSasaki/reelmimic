@@ -19,7 +19,7 @@ interface Scenario {
   shotPass: (shot: string, round: number) => boolean;
   sharedFix?: (chunk: string, call: number) => boolean;    // the builder reports a shared-file problem instead
   castShared?: (char: string, call: number) => boolean;
-  critique: (round: number) => { must?: number; needs?: number };
+  critique: (round: number) => { must?: number; needs?: number; lostPeak?: boolean };
   buildDelayMs?: number;                                   // let the per-shot watcher (every 4 s) pick shots up
 }
 let S: Scenario;
@@ -31,7 +31,7 @@ function outputs(prompt: string, dir: string): [string, Record<string, unknown>]
   const m = (re: RegExp) => prompt.match(re);
   const json = (o: unknown) => o;
   let r: RegExpMatchArray | null;
-  if (m(/## 步驟：風格拆解/)) return ['style', { 'analysis/STYLE.md': '# 2D', 'analysis/route.json': { engine: 'no-such-engine' } }];
+  if (m(/## 步驟：風格拆解/)) return ['style', { 'analysis/STYLE.md': '# 2D', 'analysis/route.json': { engine: 'no-such-engine' }, 'analysis/peaks.json': [{ id: 'P1', hit: 2 }] }];
   if (m(/## 步驟：前製企劃/)) return ['plan', { 'plan.json': { title: 'T', version: 1, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js` })) }, 'STORYBOARD.md': '# SB' }];
   if ((r = m(/## 步驟：做角色「[^」]+」[\s\S]*?只寫 (\S+?)：/))) return [`pre_cast`, { [r[1]]: '// character' }];
   if (m(/## 步驟：整合前製結果/)) return ['plan_frames', { 'plan.json': { title: 'T', version: 2, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js` })) } }];
@@ -69,7 +69,7 @@ function outputs(prompt: string, dir: string): [string, Record<string, unknown>]
   if (m(/## 步驟：組裝成片/)) return ['assemble', { 'out/video.mp4': 'mp4' }];
   if (m(/獨立評審/)) {
     const round = bump(`critique-${dir}`), c = S.critique(round);
-    return [`critique`, { 'out/check/critique.json': { must_fix: Array.from({ length: c.must || 0 }, (_, i) => ({ shot: 'S1', issue: `must ${i}` })), needs_user: Array.from({ length: c.needs || 0 }, () => ({ kind: 'text', issue: 'confirm the lyric' })) } }];
+    return [`critique`, { 'out/check/critique.json': { peaks: [{ id: 'P1', verdict: c.lostPeak ? 'ref_better' : 'equal', why: 'smaller hit' }], must_fix: Array.from({ length: c.must || 0 }, (_, i) => ({ shot: 'S1', issue: `must ${i}` })), needs_user: Array.from({ length: c.needs || 0 }, () => ({ kind: 'text', issue: 'confirm the lyric' })) } }];
   }
   if (m(/## 步驟：修改成片/)) return ['revise', { 'out/video.mp4': 'mp4', 'out/check/fixes.json': [{ status: 'fixed' }] }];
   throw new Error('fake agent: unknown step\n' + prompt.slice(0, 300));
@@ -152,6 +152,24 @@ describe('production', () => {
     assert.ok(!calls.includes('fix:C1'));
     assert.deepEqual(calls.slice(-3), ['critique', 'revise', 'critique']);
     assert.equal(J.load(id).critiqueRounds, 2);
+  });
+
+  test('a climax that loses to the reference is sent back even with no must-fix listed', async () => {
+    S = base({ critique: (r) => ({ lostPeak: r === 1 }) });
+    const id = newProject('plan_review');
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    assert.deepEqual(calls.slice(-3), ['critique', 'revise', 'critique']);
+    assert.ok(J.load(id).chat.some((c) => /高潮 P1 輸給參考片/.test(c.text) || /1 項必修/.test(c.text)));
+  });
+
+  test('no shot is built before the characters pass', async () => {
+    S = base({ castPass: (_w, r) => r >= 2 });
+    const id = newProject('plan_review');
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    const firstBuild = calls.findIndex((c) => c.startsWith('build:'));
+    assert.ok(firstBuild > calls.lastIndexOf('cast_qa:serial'), calls.join(' '));
   });
 
   test('shot reviews start while the builder is still working (per-shot watcher)', async () => {
@@ -294,5 +312,20 @@ describe('no characters', () => {
     await J.message(id, 'make the title bigger');
     assert.ok(!calls.some((c) => c.startsWith('cast_')), calls.join(', '));
     assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+  });
+});
+
+describe('restart', () => {
+  test('an interrupted job resumes on its own', async () => {
+    S = base();
+    const id = newProject('plan_review');
+    writeFileSync(join(J.dirOf(id), 'job.json'), JSON.stringify({ ...J.load(id), stage: 'replanning' }));
+    const cut = J.recoverOrphans();
+    assert.ok(cut.includes(id));
+    assert.equal(J.load(id).stage, 'error');
+    J.autoResume([id], 1);
+    for (let i = 0; i < 100 && J.load(id).stage !== 'plan_review'; i++) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(J.load(id).stage, 'plan_review');
+    assert.ok(calls.includes('replan'));
   });
 });

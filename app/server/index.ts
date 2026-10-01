@@ -126,5 +126,6 @@ app.get<'/files/:id/*', { id: string; 0: string }>('/files/:id/*', (req, res) =>
 const dist = join(import.meta.dirname, '..', 'dist');
 if (existsSync(dist)) { app.use(express.static(dist)); app.get(/^\/(?!api|files).*/, (req, res) => res.sendFile(join(dist, 'index.html'))); }
 
-J.recoverOrphans();
+const cut = J.recoverOrphans();
+if (cut.length && process.env.AUTO_RESUME !== '0') { console.log(`Resuming ${cut.length} interrupted job(s): ${cut.join(', ')}`); J.autoResume(cut); }
 app.listen(PORT, '127.0.0.1', () => console.log(`ReelMimic → http://localhost:${PORT}`));

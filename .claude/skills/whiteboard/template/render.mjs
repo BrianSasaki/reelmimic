@@ -17,7 +17,7 @@
 //   --chrome=<path to Chrome/Chromium>.
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
@@ -47,8 +47,12 @@ const fields = s => { const out = []; let d = 0, cur = ''; for (const ch of Stri
 const TV_RANGE = ['-vf', 'scale=out_range=tv', '-pix_fmt', 'yuv420p', '-color_range', 'tv'];
 
 if (args.encode) {
-  const out = args.out || 'out/video.mp4', n = readdirSync(FRAMES_DIR).filter(f => f.endsWith('.jpg')).length, audio = args.audio;
-  console.log(`encoding ${n} frames → ${out}${audio ? ' with ' + audio : ''}`);
+  // no page here, so read PROJECT.audio from the config file (encoding used to drop the music when --audio was left out)
+  const cfg = existsSync('src/config.js') ? readFileSync('src/config.js', 'utf8') : '';
+  const audio = args.audio || cfg.match(/\baudio\s*:\s*['"`]([^'"`]+)['"`]/)?.[1];
+  const out = args.out || 'out/video.mp4', n = readdirSync(FRAMES_DIR).filter(f => f.endsWith('.jpg')).length;
+  if (audio && !existsSync(audio)) { console.error(`audio file not found: ${audio}`); process.exit(1); }
+  console.log(`encoding ${n} frames → ${out}${audio ? ' with ' + audio : ' — WARNING: no audio track (pass --audio or set PROJECT.audio)'}`);
   await run('ffmpeg', ['-y', '-loglevel', 'error', '-stats', '-framerate', String(fps), '-i', `${FRAMES_DIR}/f%05d.jpg`,
     ...(audio ? ['-i', audio, '-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-shortest'] : []),
     '-c:v', 'libx264', '-preset', 'slow', '-crf', '17', ...TV_RANGE, '-movflags', '+faststart', out]);
