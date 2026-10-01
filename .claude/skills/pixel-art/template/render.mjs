@@ -19,7 +19,7 @@
 //   At most RENDER_SLOTS (default 4) renders hold a Chrome at once on this machine; the rest wait their turn.
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync, unlinkSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -89,6 +89,14 @@ async function takeSlot() {
     await new Promise(r => setTimeout(r, 1000));
   }
 }
+// Chrome's temp profile is removed on browser.close(), but a render killed mid-way (an agent's turn ending) leaves it
+// behind: 266 of them (15 GB) had piled up on one machine. Sweep profiles untouched for 6 hours (none of those is live).
+try {
+  for (const d of readdirSync(tmpdir()).filter(n => n.startsWith('puppeteer_dev_chrome_profile-'))) {
+    const p = `${tmpdir()}/${d}`;
+    if (Date.now() - statSync(p).mtimeMs > 6 * 3600e3) rmSync(p, { recursive: true, force: true });
+  }
+} catch {}
 const slot = await takeSlot();
 process.on('exit', () => { try { unlinkSync(slot); } catch {} });
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(1));
