@@ -105,7 +105,8 @@ projects/<id>/
 ## 生產線檔案（核准後）
 
 ```
-build/production.json            導演：{ cast_sheet, characters, chunks: [{id, shots}], shot_files, how_to_preview, how_to_render, shared_readonly }
+build/production.json            導演：{ cast_sheet, characters, chunks: [{id, shots}], shot_files, how_to_preview, how_to_render, shared_readonly,
+                                 prerender: { cwd, cmd 含 {start} {end} } ← 有影格快取的引擎才寫；每段通過審查後系統自動在背景渲染那段的正式影格 }
 out/check/cast/sheet_<角色>.jpg   每個角色一張設定圖（正面/3/4/側面/表情/姿勢）；sheet.jpg = 全角色並排
 build/assets/cast/<角色>.js      每個角色一個定義檔（多角色時各自由一組審查＋修正同時進行，不能共用一個檔）
 out/check/cast/review_<角色>.json / fixes_<角色>.json  個別角色的審查與修正（要改共用骨架的項目 status: shared，由導演統一改）

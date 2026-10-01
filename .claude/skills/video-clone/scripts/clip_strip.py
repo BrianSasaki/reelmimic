@@ -4,7 +4,11 @@
 Stills can't show motion or a climax: a hit is the frames around it. Use this whenever you judge a moment.
 
     python clip_strip.py out/video.mp4 --range 24.0:26.0 --out out/check/peak_1.jpg
-    python clip_strip.py out/video.mp4 --range 24.0:26.0 --vs analysis/source.mp4 --vs-range 25.0:27.0 --out out/check/peak_1_vs_ref.jpg
+    python clip_strip.py out/video.mp4 --range 24.0:26.0 --vs analysis/proxy.mp4 --vs-range 25.0:27.0 --out out/check/peak_1_vs_ref.jpg
+
+The reference is the file analyze.py actually analysed (report.json "analysed": proxy.mp4 when the picture had to be
+cropped out of a screen recording). Passing analysis/source.mp4 is switched to proxy.mp4 automatically when one exists,
+and a reference row that comes out (almost) black stops with an error instead of producing a fake comparison.
 
 --fps (default 12) frames per second of the stretch; --w (default 240) width of each frame; --cols (default 12).
 With --vs, the reference range is sampled into the same number of frames and each reference row sits directly above
@@ -49,8 +53,15 @@ def main():
     ours = grab(a.video, s, e, n, a.w)
     ref = None
     if a.vs:
+        vs = a.vs
+        proxy = os.path.join(os.path.dirname(vs), "proxy.mp4")
+        if os.path.basename(vs).startswith("source.") and os.path.isfile(proxy):
+            print(f"reference: using {proxy} (the cropped picture) instead of {vs}"); vs = proxy
         rs, re_ = map(float, (a.vs_range or a.range).split(":"))
-        ref = grab(a.vs, rs, re_, len(ours), a.w)
+        ref = grab(vs, rs, re_, len(ours), a.w)
+        dark = sum(1 for _, im in ref if max(im.convert("L").getextrema()) < 30) / max(1, len(ref))
+        if dark > 0.8:
+            raise SystemExit(f"reference rows are black ({dark:.0%} of frames) — wrong file or time range? Use the file in report.json 'analysed' (usually analysis/proxy.mp4)")
     fh = ours[0][1].height; lab = 18; f = font(13)
     rows = [ours[i:i + a.cols] for i in range(0, len(ours), a.cols)]
     refrows = [ref[i:i + a.cols] for i in range(0, len(ref), a.cols)] if ref else []

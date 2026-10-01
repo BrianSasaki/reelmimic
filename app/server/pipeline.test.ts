@@ -21,6 +21,7 @@ interface Scenario {
   castShared?: (char: string, call: number) => boolean;
   critique: (round: number) => { must?: number; needs?: number; lostPeak?: boolean };
   buildDelayMs?: number;                                   // let the per-shot watcher (every 4 s) pick shots up
+  prerender?: string;                                      // production.json prerender command
 }
 let S: Scenario;
 let calls: string[] = [];
@@ -37,7 +38,7 @@ function outputs(prompt: string, dir: string): [string, Record<string, unknown>]
   if (m(/## 步驟：整合前製結果/)) return ['plan_frames', { 'plan.json': { title: 'T', version: 2, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js` })) } }];
   if (m(/## 步驟：依使用者意見修改企劃/)) return ['replan', { 'plan.json': { title: 'T', version: 3 } }];
   if (m(/## 步驟：製作準備/)) return ['setup', {
-    'build/production.json': { chunks: S.chunks, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js`, sheet: `out/check/cast/sheet_${id}.jpg` })) },
+    'build/production.json': { ...(S.prerender ? { prerender: { cwd: '.', cmd: S.prerender } } : {}), chunks: S.chunks, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js`, sheet: `out/check/cast/sheet_${id}.jpg` })) },
     ...(S.chars.length ? { 'out/check/cast/sheet.jpg': 'jpg' } : {}), ...Object.fromEntries(S.chars.map((id) => [`out/check/cast/sheet_${id}.jpg`, 'jpg'])) }];   // no cast → no sheet
   if (m(/## 步驟：角色關/)) {
     const round = +(m(/第 (\d+) 輪/)?.[1] || 1), ch = m(/結果寫到 out\/check\/cast\/review_(\S+?)\.json/)?.[1];
@@ -170,6 +171,36 @@ describe('production', () => {
     assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
     const firstBuild = calls.findIndex((c) => c.startsWith('build:'));
     assert.ok(firstBuild > calls.lastIndexOf('cast_qa:serial'), calls.join(' '));
+  });
+
+  test('one blocker left at the round limit gets one more round instead of pausing', async () => {
+    S = base({ shotPass: (s, r) => s !== 'S1' || r >= 4 });
+    const id = newProject('plan_review');
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    assert.ok(calls.includes('shot_qa:S1:4'));
+  });
+
+  test('two must-fix items left at the final limit get one more revise', async () => {
+    S = base({ critique: (r) => ({ must: r <= 3 ? 2 : 0 }) });
+    const id = newProject('plan_review');
+    await J.approve(id);
+    assert.equal(calls.filter((c) => c === 'revise').length, 3);
+    assert.equal(J.load(id).lastCritique?.pass, true);
+  });
+
+  test('a passed segment is rendered in the background and assembly waits for it', async () => {
+    S = base({ prerender: 'node -e setTimeout(()=>{},300)' });
+    const id = newProject('plan_review');
+    writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, shots: [{ id: 'S1', start_s: 0, end_s: 2 }, { id: 'S2', start_s: 2, end_s: 4 }] }));
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    const ev = readFileSync(join(J.dirOf(id), 'logs', 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    const pre = ev.filter((e) => e.name === 'prerender'), doneAt = ev.filter((e) => /背景渲染 C\d：完成/.test(e.text || ''));
+    assert.equal(pre.length, 2);
+    assert.equal(doneAt.length, 2);
+    const assemble = ev.findIndex((e) => e.type === 'turn' && e.phase === 'assemble');
+    assert.ok(ev.indexOf(doneAt[1]) < assemble, 'assembly started before the background render finished');
   });
 
   test('shot reviews start while the builder is still working (per-shot watcher)', async () => {

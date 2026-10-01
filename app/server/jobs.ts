@@ -8,9 +8,9 @@
 //       → critiquing: final panel (fresh critic: continuity/pacing/seams, verifies earlier fixes) ⇄ revising
 //       → done   (needs_user items never trigger a revise: they pause the job and ask the user)
 // Quality is checked where defects are born (each character, each chunk), not only at the end.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, cpSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, statfsSync, cpSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { runAgent, type AgentResult } from './agents/index.ts';
 import { prompts as bootPrompts } from './prompts.ts';
@@ -75,7 +75,7 @@ export type BusEvent = { type: 'job'; job: Job } | { type: 'log'; ev: LogEvent }
 export const bus = new EventEmitter<{ job: [id: string, ev: BusEvent] }>(); bus.setMaxListeners(100);
 const running = new Map<string, Set<AbortController>>();
 // Stop every agent this server started (on shutdown), so none keeps working unseen after a restart.
-export function stopAll() { for (const set of running.values()) for (const ac of set) ac.abort(); }
+export function stopAll() { for (const set of running.values()) for (const ac of set) ac.abort(); for (const set of prerenderProcs.values()) for (const p of set) p.kill(); }
 
 const now = () => new Date().toISOString();
 export const dirOf = (id: string) => join(PROJECTS, id);
@@ -324,9 +324,19 @@ function collectNeeds(id: string, items: NeedRequest[] | undefined, from: string
   return add.length;
 }
 
+// Renders need room (frames, previews, the encode): warn early instead of failing mid-render. A real run had 66 MB left.
+const MIN_FREE_GB = 5;
+function diskWarning(id: string) {
+  try {
+    const f = statfsSync(PROJECTS), gb = (f.bavail * f.bsize) / 2 ** 30;
+    if (gb < MIN_FREE_GB) chat(id, 'system', L(id, `⚠️ 磁碟只剩 ${gb.toFixed(1)} GB，渲染可能中途失敗；建議先清出 ${MIN_FREE_GB} GB 以上。`, `⚠️ Only ${gb.toFixed(1)} GB of disk left; rendering may fail midway. Free at least ${MIN_FREE_GB} GB first.`));
+  } catch { /* statfs unsupported: skip */ }
+}
+
 // ---------- pre-production ----------
 const STYLE_OUT = ['analysis/STYLE.md', 'analysis/route.json', 'analysis/peaks.json'];   // peaks: the reference's goosebump moments
 export async function start(id: string) {
+  diskWarning(id);
   if (!(await analyze(id))) return;
   if (!(await step(id, 'styling', 'style', {}, STYLE_OUT, 'styled'))) return;
   await preProduction(id);
@@ -423,6 +433,7 @@ export async function approve(id: string) {
   if (open.length) throw Object.assign(new Error('還有需要你提供或略過的素材：' + open.map((r) => r.label || r.id).join('、')), { code: 409 });
   await alignIfReady(id).catch(() => null);   // lyrics pasted before the music arrived: time them now, before anything is built
   update(id, (j) => { j.approvedAt = now(); j.approvedPlanVersion = readJSON<Plan>(join(dirOf(id), 'plan.json'))?.version; j.engineSnapshot = snapshotEngine(id); j.pipeline = {}; j.sessions = j.approvedAtPrev ? {} : Object.fromEntries(Object.entries(j.sessions || {}).filter(([k]) => k.startsWith('cast-'))); j.approvedAtPrev = true; j.needs = []; j.userNote = null; j.critiqueRounds = 0; });
+  diskWarning(id);
   chat(id, 'system', L(id, `企劃已核准，開始生產：角色關 → 分段製作（每段做完立刻審）→ 組裝 → 最後評審`, 'Plan approved. Production: characters → parts built and reviewed as they finish → assembly → final review'));
   if (await production(id, { fresh: true })) await finalPanel(id);
 }
@@ -496,8 +507,10 @@ async function production(id: string, { fresh = false } = {}): Promise<boolean> 
       const needs = c.shots.flatMap((x) => results[x]?.needs || []);
       if (collectNeeds(id, needs, `shot-qa-${c.id}`)) { set({ state: 'needs_user' }); return false; }
       const bad = c.shots.map((x) => results[x]?.entry).filter((e): e is ShotEntry => !!e && !shotPassed(e));
-      if (!bad.length) { set({ state: 'passed' }); return true; }
-      if (round >= rounds(id).chunkRounds) { set({ state: 'failed', open: bad.length }); return false; }
+      if (!bad.length) { set({ state: 'passed' }); prerender(id, c); return true; }
+      // one blocker left at the limit: one more round instead of pausing (a real run sat 23 minutes waiting to say "fix it")
+      const left = bad.flatMap((e) => e.issues || []).filter((x) => x.severity !== 'polish').length;
+      if (round >= rounds(id).chunkRounds + (left <= 1 ? 1 : 0)) { set({ state: 'failed', open: bad.length }); return false; }
       set({ state: 'fixing' });
       const f = await turn(id, 'fix_chunk', { chunk: c, bad, round, message: load(id).userNote }, [`out/check/shots/${c.id}.fixes.json`], { session: key, who: key });
       if (!f.ok) { set({ state: 'error' }); return false; }
@@ -530,8 +543,9 @@ async function production(id: string, { fresh = false } = {}): Promise<boolean> 
   if ((j.needs || []).length) return pause(id);
   const failed = Object.entries(j.pipeline.chunks || {}).filter(([, v]) => v.state !== 'passed');
   if (failed.length) { chat(id, 'system', L(id, `有 ${failed.length} 段沒通過鏡頭審查：${failed.map(([k, v]) => `${k}(${v.state})`).join('、')}，請你看這幾段決定`, `${failed.length} part${failed.length > 1 ? 's' : ''} didn't pass shot review: ${failed.map(([k, v]) => `${k} (${v.state})`).join(', ')}. Please take a look and decide`)); setStage(id, 'needs_input'); return false; }
-  // 4) assemble
+  // 4) assemble (after the background renders of passed segments, so their frames are reused, not redrawn)
   pipe(id, (p) => { p.phase = 'assemble'; });
+  await (prerenderQ.get(id) || Promise.resolve());
   return step(id, 'producing', 'assemble', {}, ['out/video.mp4'], 'done');
 }
 // ---------- cast gate ----------
@@ -615,6 +629,31 @@ async function castSerial(id: string, prev: Pipeline, firstReview?: Review | nul
   return true;
 }
 
+// ---------- background render of passed segments ----------
+// Engines with a frame cache (render.mjs --frames) declare production.json "prerender": { cwd, cmd with {start} {end} }.
+// When a segment passes review its final frames are rendered in the background, one segment at a time per project (they
+// share out/frames/manifest.json), so assembly only redraws what changed afterwards. A real run spent 29 minutes
+// re-rendering all 732 frames at assembly.
+const prerenderQ = new Map<string, Promise<void>>(), prerenderProcs = new Map<string, Set<ChildProcess>>();
+function prerender(id: string, c: Chunk) {
+  const d = dirOf(id), pr = (readJSON<Production>(join(d, 'build', 'production.json')) || {}).prerender as { cwd?: string; cmd?: string } | undefined;
+  if (!pr?.cmd) return;
+  type S = { id?: string; start_s?: number; end_s?: number };
+  const mine = ((readJSON<Plan>(join(d, 'plan.json'))?.shots || []) as S[]).filter((s) => s.id && c.shots.includes(s.id) && s.start_s != null && s.end_s != null);
+  if (!mine.length) return;
+  const a = Math.min(...mine.map((s) => s.start_s!)), b = Math.max(...mine.map((s) => s.end_s!));
+  const [bin, ...args] = pr.cmd.replace('{start}', a.toFixed(3)).replace('{end}', b.toFixed(3)).split(/\s+/);
+  const run = () => new Promise<void>((resolve) => {
+    if (load(id).stage === 'error') return resolve();   // cancelled or failed meanwhile
+    log(id, { type: 'tool', name: 'prerender', detail: `${c.id} ${a.toFixed(2)}–${b.toFixed(2)} s: ${bin} ${args.join(' ')}` });
+    const t0 = Date.now(), p = spawn(bin, args, { cwd: join(d, pr.cwd || 'build'), env: process.env, stdio: 'ignore' });
+    const set = prerenderProcs.get(id) || new Set(); set.add(p); prerenderProcs.set(id, set);
+    const done = (ok: boolean) => { set.delete(p); log(id, { type: ok ? 'text' : 'error', text: `背景渲染 ${c.id}：${ok ? `完成（${Math.round((Date.now() - t0) / 1000)} s）` : '失敗（組裝時會重渲）'}` }); resolve(); };
+    p.on('error', () => done(false)); p.on('close', (code) => done(code === 0));
+  });
+  prerenderQ.set(id, (prerenderQ.get(id) || Promise.resolve()).then(run));
+}
+
 // at most CONFIG.maxReviews shot reviews of one project at a time (each grabs frames in Chrome)
 const reviewQ = new Map<string, { n: number; wait: (() => void)[] }>();
 async function reviewSlot<T>(id: string, fn: () => Promise<T>): Promise<T> {
@@ -644,7 +683,8 @@ async function finalPanel(id: string) {
     update(id, (j) => { j.critiqueRounds = total; j.lastCritique = { pass: !must.length, must: must.length, at: now() }; });
     const needs = collectNeeds(id, c.needs_user, 'critic');
     if (!must.length) { chat(id, 'system', needs ? L(id, '評審：導演能修的都過了，剩下需要你提供的項目', 'Final review: everything the director can fix is done. What is left needs your input') : L(id, `評審通過（第 ${total} 輪）`, `Final review passed (round ${total})`)); setStage(id, needs ? 'needs_input' : 'done'); return; }
-    if (round > rounds(id).finalRounds) { chat(id, 'system', L(id, `評審仍有 ${must.length} 項必修，已達自動修改上限，請你決定`, `The final review still has ${must.length} must-fix item${must.length > 1 ? 's' : ''} and the automatic fix limit is reached. Please decide`)); setStage(id, 'done'); return; }
+    // ≤ 2 items left at the limit: one more revise instead of stopping with them unfixed
+    if (round > rounds(id).finalRounds + (must.length <= 2 ? 1 : 0)) { chat(id, 'system', L(id, `評審仍有 ${must.length} 項必修，已達自動修改上限，請你決定`, `The final review still has ${must.length} must-fix item${must.length > 1 ? 's' : ''} and the automatic fix limit is reached. Please decide`)); setStage(id, 'done'); return; }
     const msg = must.map((m, i) => `${i + 1}. [${m.shot || '全片'}${m.time != null ? ' ' + m.time + 's' : ''}] ${m.issue}${m.fix ? ' → 建議：' + m.fix : ''}`).join('\n');
     chat(id, 'system', L(id, `評審第 ${total} 輪：${must.length} 項必修，交回導演（每項要附修改前後對照）`, `Final review round ${total}: ${must.length} must-fix item${must.length > 1 ? 's' : ''}, sent back to the director (each fix needs before/after proof)`));
     if (!(await step(id, 'revising', 'revise', { message: msg, round }, ['out/video.mp4', 'out/check/fixes.json']))) return;
@@ -676,5 +716,5 @@ export async function accept(id: string) {
   if (await production(id)) await finalPanel(id);
 }
 
-export function cancel(id: string) { for (const ac of running.get(id) || []) ac.abort(); }
+export function cancel(id: string) { for (const ac of running.get(id) || []) ac.abort(); for (const p of prerenderProcs.get(id) || []) p.kill(); }
 export async function critique(id: string) { return finalPanel(id); }

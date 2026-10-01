@@ -2,25 +2,28 @@
 //
 //   Look at it (open the images with your image viewer / Read tool):
 //     node render.mjs --sheet=0.5,1,1.5,2 [--cols=4] [--w=480] --out=out/check/a.jpg        contact sheet of chosen times
-//     node render.mjs --strip=2.0:2.5 [--cols=6] [--w=320] --out=out/check/strip.jpg        EVERY frame in a stretch (motion)
+//     node render.mjs --strip=2.0:2.5 [--cols=6] [--w=320] --out=out/check/strip.jpg        a stretch at 12 fps (motion; --every=1 for every frame)
 //     node render.mjs --sheet=2.1,2.2 --crop=760,300,400,400 --w=600 --out=out/check/face.jpg full-res crops (details)
 //     node render.mjs --strip=2.0:2.5 --crop-at=960,780,500,400 --out=out/check/feet.jpg       crops that follow a WORLD point
 //         (x,y in world px, may be page expressions like PLK.MX(1.38); w,h in screen px) through each frame's camera
 //     node render.mjs --stills=1.2,3.4 --out=out/stills                                     full-res PNGs
 //   Make the video:
 //     node render.mjs --clip [--range=0:4] --out=out/video.mp4                               straight to MP4 (one worker)
-//     node render.mjs --frames [--range=0:8] --workers=4                                     JPEG frames → out/frames (parallel, resumable)
+//     node render.mjs --frames [--range=0:8] --workers=4                                     JPEG frames → out/frames (parallel, resumable, cached:
+//                                                                                              only frames of shots whose files changed are redrawn)
 //     node render.mjs --encode --out=out/video.mp4                                           out/frames → MP4
 //   Standalone loops (LOOPS in the page): add --loop=<name> to any of the above (times are then loop times), or
 //     node render.mjs --loop=emotions --png --out=out/loop_emotions                          one cycle as PNGs (for GIFs)
 //   Music: --audio=assets/song.mp3 (or PROJECT.audio) is muxed into --clip and --encode. Other flags: --fps=24,
-//   --chrome=<path to Chrome/Chromium>.
+//   --chrome=<path to Chrome/Chromium>, --no-cache (redraw every frame in --frames).
+//   At most RENDER_SLOTS (default 4) renders hold a Chrome at once on this machine; the rest wait their turn.
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => { const [k, v] = a.replace(/^--/, '').split('='); return [k, v ?? true]; }));
 const CHROMES = [args.chrome, process.env.CHROME_PATH, 'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
@@ -70,6 +73,26 @@ const gpu = args['soft-gl'] ? ['--use-angle=swiftshader', '--enable-unsafe-swift
   : process.platform === 'win32' ? ['--use-angle=d3d11'] : process.platform === 'darwin' ? ['--use-angle=metal'] : ['--use-gl=angle'];
 // Ubuntu 23.10+ blocks Chrome's user-namespace sandbox; headless rendering of local files doesn't need it.
 const sandbox = process.platform === 'linux' ? ['--no-sandbox'] : [];
+// One machine-wide slot per render (lock files): many agents rendering at once made page loads time out and retry.
+// A slot whose owner died (its turn was cut off) is taken back.
+const SLOT_DIR = `${tmpdir()}/reelmimic_render_slots`, SLOTS = +(process.env.RENDER_SLOTS || 4);
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+async function takeSlot() {
+  mkdirSync(SLOT_DIR, { recursive: true });
+  for (let waited = 0; ; waited++) {
+    for (let i = 0; i < SLOTS; i++) {
+      const f = `${SLOT_DIR}/slot${i}`;
+      try { writeFileSync(f, String(process.pid), { flag: 'wx' }); return f; } catch {}
+      try { if (!alive(+readFileSync(f, 'utf8'))) unlinkSync(f); } catch {}
+    }
+    if (waited && waited % 30 === 0) console.log(`waiting for a render slot (${SLOTS} in use machine-wide)…`);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+const slot = await takeSlot();
+process.on('exit', () => { try { unlinkSync(slot); } catch {} });
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(1));
+
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: true, protocolTimeout: 0,
   args: [...sandbox, '--allow-file-access-from-files', '--ignore-gpu-blocklist', ...gpu, '--enable-gpu-rasterization', '--window-size=1920,1080', '--disable-renderer-backgrounding', '--disable-background-timer-throttling']
@@ -94,13 +117,30 @@ const frameOf = async (page, t, type, q) => {
   const url = await page.evaluate((t, type, q) => window.renderAt(t, type, q), t, type, q);
   return Buffer.from(url.slice(url.indexOf(',') + 1), 'base64');
 };
+// Frame key = hash(every shared file) + hash(the scene file that draws the frame's shot). Shared: studio.html, src/ outside
+// src/scenes/, assets/ (size + mtime). A shot's scene file is the one whose text contains its function. Shots come from
+// the page (SHOTS: [start, fn] in time order); a page without SHOTS gets no cache.
+async function frameKeyer(fps) {
+  const probe = await openPage(), shots = await probe.evaluate(() => (typeof SHOTS !== 'undefined' ? SHOTS.map(s => [s[0], String(s[1])]) : [])); await probe.close();
+  if (!shots.length) return () => null;
+  const walk = d => existsSync(d) ? readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(`${d}/${e.name}`) : [`${d}/${e.name}`]) : [];
+  const h = createHash('sha1');
+  for (const f of ['studio.html', ...walk('src').filter(f => !f.startsWith('src/scenes/')), ...walk('assets')].sort()) {
+    const st = statSync(f); h.update(/\.(js|json|html|css)$/.test(f) ? readFileSync(f) : `${f}:${st.size}:${st.mtimeMs}`);
+  }
+  const shared = h.digest('hex');
+  const scenes = walk('src/scenes').map(f => [f, readFileSync(f, 'utf8')]);
+  const keys = shots.map(([, src]) => { const own = scenes.find(([, txt]) => txt.includes(src)); return createHash('sha1').update(shared).update(own ? own[1] : src).digest('hex').slice(0, 16); });
+  return i => { const t = i / fps; let k = 0; while (k + 1 < shots.length && t >= shots[k + 1][0]) k++; return keys[k]; };
+}
+
 // the length of whatever is being rendered: a loop's .len, or the video's duration
 const lengthOf = page => page.evaluate(() => window.LOOP ? window.LOOP.len : DUR);
 
 if (args.sheet || args.strip) {
   const page = await openPage(), out = args.out || 'out/sheet.jpg'; mkdirSync(dirname(out), { recursive: true });
   let ts;
-  if (args.strip) { const [a, b] = span(args.strip); ts = []; for (let i = Math.round(a * fps); i <= Math.round(b * fps); i++) ts.push(i / fps); }
+  if (args.strip) { const [a, b] = span(args.strip), step = +(args.every || Math.max(1, Math.round(fps / 12))); ts = []; for (let i = Math.round(a * fps); i <= Math.round(b * fps); i += step) ts.push(i / fps); }
   else ts = times(args.sheet);
   const crop = args.crop ? times(args.crop) : null, at = args['crop-at'] ? fields(args['crop-at']) : null;
   const { url, ms } = await page.evaluate((ts, c, w, crop, at) => window.renderSheet(ts, c, w, crop, at), ts, +(args.cols || (args.strip ? 6 : 3)), +(args.w || (args.strip ? 320 : 640)), crop, at);
@@ -131,8 +171,17 @@ if (args.sheet || args.strip) {
   const [a, b] = args.range ? span(args.range) : [0, len], workers = +(args.workers || 4);
   mkdirSync(FRAMES_DIR, { recursive: true });
   const first = Math.round(a * fps), last = Math.min(Math.ceil(len * fps) - 1, Math.round(b * fps) - 1);
-  const todo = []; for (let i = first; i <= last; i++) { const f = `${FRAMES_DIR}/f${String(i).padStart(5, '0')}.jpg`; if (!existsSync(f) || statSync(f).size < 1000) todo.push(i); }
-  console.log(`${todo.length} frames to render (${last - first + 1 - todo.length} already done), ${workers} workers`);
+  // cache: each frame remembers the key it was drawn with (shared files + the scene file of its shot); a changed key redraws it
+  const keyOf = args.loop || args['no-cache'] ? () => null : await frameKeyer(fps);
+  const MAN = `${FRAMES_DIR}/manifest.json`, man = (() => { try { const m = JSON.parse(readFileSync(MAN, 'utf8')); return m.fps === fps ? m.frames : {}; } catch { return {}; } })();
+  const saveMan = () => { writeFileSync(MAN + '.tmp', JSON.stringify({ fps, frames: man })); renameSync(MAN + '.tmp', MAN); };
+  const todo = []; let stale = 0;
+  for (let i = first; i <= last; i++) {
+    const f = `${FRAMES_DIR}/f${String(i).padStart(5, '0')}.jpg`, k = keyOf(i);
+    if (!existsSync(f) || statSync(f).size < 1000) todo.push(i);
+    else if (k && man[i] !== k) { todo.push(i); stale++; }
+  }
+  console.log(`${todo.length} frames to render (${stale} changed since last render, ${last - first + 1 - todo.length} cached), ${workers} workers`);
   let next = 0, done = 0; const start = Date.now();
   await Promise.all(Array.from({ length: workers }, async (_, w) => {
     const page = await openPage('#' + w);
@@ -140,7 +189,9 @@ if (args.sheet || args.strip) {
       const i = todo[next++], f = `${FRAMES_DIR}/f${String(i).padStart(5, '0')}.jpg`;
       const buf = await frameOf(page, i / fps, 'image/jpeg', .94);
       writeFileSync(f + '.tmp', buf); renameSync(f + '.tmp', f);
+      const k = keyOf(i); if (k) man[i] = k;
       if (++done % 24 === 0 || done === todo.length) {
+        saveMan();
         const el = (Date.now() - start) / 1000;
         console.log(`frame ${done}/${todo.length}  ${(el / done * 1000).toFixed(0)} ms/frame effective  eta ${((todo.length - done) * el / done / 60).toFixed(1)} min`);
       }
