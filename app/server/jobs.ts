@@ -683,6 +683,7 @@ function pause(id: string) { setStage(id, 'needs_input'); return false; }
 // ---------- final panel: seams, continuity, pacing; verifies every earlier fix ----------
 async function finalPanel(id: string) {
   const d = dirOf(id);
+  let prevMust = Infinity;
   for (let round = 1; ; round++) {
     pipe(id, (p) => { p.phase = 'final'; p.final = { round }; });
     if (!(await step(id, 'critiquing', 'critique', { round }, ['out/check/critique.json'], null, { session: 'fresh', who: 'critic' }))) return;
@@ -695,8 +696,11 @@ async function finalPanel(id: string) {
     update(id, (j) => { j.critiqueRounds = total; j.lastCritique = { pass: !must.length, must: must.length, at: now() }; });
     const needs = collectNeeds(id, c.needs_user, 'critic');
     if (!must.length) { chat(id, 'system', needs ? L(id, '評審：導演能修的都過了，剩下需要你提供的項目', 'Final review: everything the director can fix is done. What is left needs your input') : L(id, `評審通過（第 ${total} 輪）`, `Final review passed (round ${total})`)); setStage(id, needs ? 'needs_input' : 'done'); return; }
-    // ≤ 2 items left at the limit: one more revise instead of stopping with them unfixed
-    if (round > rounds(id).finalRounds + (must.length <= 2 ? 1 : 0)) { chat(id, 'system', L(id, `評審仍有 ${must.length} 項必修，已達自動修改上限，請你決定`, `The final review still has ${must.length} must-fix item${must.length > 1 ? 's' : ''} and the automatic fix limit is reached. Please decide`)); setStage(id, 'done'); return; }
+    // Past the limit, keep going while the list is short (≤ 2) and still shrinking, up to 3 extra rounds: a real run went
+    // 8 → 3 → 2 → 1 and stopped with its last, most visible defect unfixed. A list that stops shrinking stops the loop.
+    const converging = must.length <= 2 && must.length < prevMust && round <= rounds(id).finalRounds + 3;
+    prevMust = must.length;
+    if (round > rounds(id).finalRounds && !converging) { chat(id, 'system', L(id, `評審仍有 ${must.length} 項必修，已達自動修改上限，請你決定`, `The final review still has ${must.length} must-fix item${must.length > 1 ? 's' : ''} and the automatic fix limit is reached. Please decide`)); setStage(id, 'done'); return; }
     const msg = must.map((m, i) => `${i + 1}. [${m.shot || '全片'}${m.time != null ? ' ' + m.time + 's' : ''}] ${m.issue}${m.fix ? ' → 建議：' + m.fix : ''}`).join('\n');
     chat(id, 'system', L(id, `評審第 ${total} 輪：${must.length} 項必修，交回導演（每項要附修改前後對照）`, `Final review round ${total}: ${must.length} must-fix item${must.length > 1 ? 's' : ''}, sent back to the director (each fix needs before/after proof)`));
     if (!(await step(id, 'revising', 'revise', { message: msg, round }, ['out/video.mp4', 'out/check/fixes.json']))) return;

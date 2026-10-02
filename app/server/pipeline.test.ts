@@ -181,12 +181,20 @@ describe('production', () => {
     assert.ok(calls.includes('shot_qa:S1:4'));
   });
 
-  test('two must-fix items left at the final limit get one more revise', async () => {
-    S = base({ critique: (r) => ({ must: r <= 3 ? 2 : 0 }) });
+  test('past the final limit, revising continues while a short must-fix list keeps shrinking', async () => {
+    S = base({ critique: (r) => ({ must: [4, 3, 2, 1, 0][r - 1] }) });
     const id = newProject('plan_review');
     await J.approve(id);
-    assert.equal(calls.filter((c) => c === 'revise').length, 3);
+    assert.equal(calls.filter((c) => c === 'revise').length, 4);
     assert.equal(J.load(id).lastCritique?.pass, true);
+  });
+
+  test('a must-fix list that stops shrinking stops at the limit', async () => {
+    S = base({ critique: () => ({ must: 2 }) });
+    const id = newProject('plan_review');
+    await J.approve(id);
+    assert.equal(calls.filter((c) => c === 'revise').length, 2);
+    assert.equal(J.load(id).lastCritique?.pass, false);
   });
 
   test('a passed segment is rendered in the background and assembly waits for it', async () => {
