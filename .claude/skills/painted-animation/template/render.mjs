@@ -221,4 +221,7 @@ if (args.sheet || args.strip) {
 } else {
   console.log('nothing to do: see the usage notes at the top of render.mjs');
 }
-await browser.close();
+// Chrome's shutdown can hang (seen: a finished --frames run sat 7 hours in browser.close(), and everything queued behind
+// it waited). Give it 10 s, then exit anyway: the work is already on disk.
+await Promise.race([browser.close(), new Promise(r => setTimeout(r, 10000))]);
+process.exit(0);

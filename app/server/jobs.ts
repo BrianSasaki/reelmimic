@@ -545,7 +545,7 @@ async function production(id: string, { fresh = false } = {}): Promise<boolean> 
   if (failed.length) { chat(id, 'system', L(id, `有 ${failed.length} 段沒通過鏡頭審查：${failed.map(([k, v]) => `${k}(${v.state})`).join('、')}，請你看這幾段決定`, `${failed.length} part${failed.length > 1 ? 's' : ''} didn't pass shot review: ${failed.map(([k, v]) => `${k} (${v.state})`).join(', ')}. Please take a look and decide`)); setStage(id, 'needs_input'); return false; }
   // 4) assemble (after the background renders of passed segments, so their frames are reused, not redrawn)
   pipe(id, (p) => { p.phase = 'assemble'; });
-  await (prerenderQ.get(id) || Promise.resolve());
+  await waitPrerenders(id);
   return step(id, 'producing', 'assemble', {}, ['out/video.mp4'], 'done');
 }
 // ---------- cast gate ----------
@@ -635,6 +635,15 @@ async function castSerial(id: string, prev: Pipeline, firstReview?: Review | nul
 // share out/frames/manifest.json), so assembly only redraws what changed afterwards. A real run spent 29 minutes
 // re-rendering all 732 frames at assembly.
 const prerenderQ = new Map<string, Promise<void>>(), prerenderProcs = new Map<string, Set<ChildProcess>>();
+const PRERENDER_MAX_MS = (seconds: number) => Math.max(10 * 60e3, seconds * 24 * 6e3);   // ~6 s a frame at worst, never under 10 min
+const ASSEMBLY_WAIT_MS = 10 * 60e3;   // assembly waits this long for background renders, then stops them and renders what's missing itself
+export async function waitPrerenders(id: string, maxMs = ASSEMBLY_WAIT_MS) {
+  const q = prerenderQ.get(id); if (!q) return;
+  let timer: NodeJS.Timeout | undefined;
+  const late = await Promise.race([q.then(() => false), new Promise<boolean>((r) => { timer = setTimeout(() => r(true), maxMs); })]);
+  clearTimeout(timer);
+  if (late) { log(id, { type: 'error', text: `背景渲染超過 ${Math.round(maxMs / 60e3)} 分鐘，先停掉，組裝時補渲` }); for (const p of prerenderProcs.get(id) || []) p.kill(); prerenderQ.delete(id); }
+}
 function prerender(id: string, c: Chunk) {
   const d = dirOf(id), pr = (readJSON<Production>(join(d, 'build', 'production.json')) || {}).prerender as { cwd?: string; cmd?: string } | undefined;
   if (!pr?.cmd) return;
@@ -648,7 +657,10 @@ function prerender(id: string, c: Chunk) {
     log(id, { type: 'tool', name: 'prerender', detail: `${c.id} ${a.toFixed(2)}–${b.toFixed(2)} s: ${bin} ${args.join(' ')}` });
     const t0 = Date.now(), p = spawn(bin, args, { cwd: join(d, pr.cwd || 'build'), env: process.env, stdio: 'ignore' });
     const set = prerenderProcs.get(id) || new Set(); set.add(p); prerenderProcs.set(id, set);
-    const done = (ok: boolean) => { set.delete(p); log(id, { type: ok ? 'text' : 'error', text: `背景渲染 ${c.id}：${ok ? `完成（${Math.round((Date.now() - t0) / 1000)} s）` : '失敗（組裝時會重渲）'}` }); resolve(); };
+    // a render that never exits must not hold the queue (seen: one sat 7 hours after finishing its frames)
+    const timer = setTimeout(() => p.kill(), PRERENDER_MAX_MS(b - a)); timer.unref();
+    let ended = false;
+    const done = (ok: boolean) => { if (ended) return; ended = true; clearTimeout(timer); set.delete(p); log(id, { type: ok ? 'text' : 'error', text: `背景渲染 ${c.id}：${ok ? `完成（${Math.round((Date.now() - t0) / 1000)} s）` : '失敗（組裝時會重渲）'}` }); resolve(); };
     p.on('error', () => done(false)); p.on('close', (code) => done(code === 0));
   });
   prerenderQ.set(id, (prerenderQ.get(id) || Promise.resolve()).then(run));
