@@ -16,7 +16,8 @@
 //     node render.mjs --loop=emotions --png --out=out/loop_emotions                          one cycle as PNGs (for GIFs)
 //   Music: --audio=assets/song.mp3 (or PROJECT.audio) is muxed into --clip and --encode. Other flags: --fps=24,
 //   --chrome=<path to Chrome/Chromium>, --no-cache (redraw every frame in --frames).
-//   At most RENDER_SLOTS (default 4) renders hold a Chrome at once on this machine; the rest wait their turn.
+//   At most RENDER_SLOTS (default 4) previews and BULK_RENDER_SLOTS (default 1) --frames/--clip/--png renders hold a Chrome
+//   at once on this machine; the rest wait their turn.
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync, unlinkSync, rmSync } from 'node:fs';
@@ -75,7 +76,10 @@ const gpu = args['soft-gl'] ? ['--use-angle=swiftshader', '--enable-unsafe-swift
 const sandbox = process.platform === 'linux' ? ['--no-sandbox'] : [];
 // One machine-wide slot per render (lock files): many agents rendering at once made page loads time out and retry.
 // A slot whose owner died (its turn was cut off) is taken back.
-const SLOT_DIR = `${tmpdir()}/reelmimic_render_slots`, SLOTS = +(process.env.RENDER_SLOTS || 4);
+// Bulk renders (--frames/--clip/--png: minutes long) get their own small pool so quick previews never queue behind them
+// (a real run: previews averaged 93 s each against 3.5 s on an idle machine, mostly waiting).
+const BULK = !!(args.frames || args.clip || args.png);
+const SLOT_DIR = `${tmpdir()}/reelmimic_render_slots${BULK ? '_bulk' : ''}`, SLOTS = +(BULK ? process.env.BULK_RENDER_SLOTS || 1 : process.env.RENDER_SLOTS || 4);
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 async function takeSlot() {
   mkdirSync(SLOT_DIR, { recursive: true });
