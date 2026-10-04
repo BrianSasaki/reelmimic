@@ -451,6 +451,7 @@ async function production(id: string, { fresh = false } = {}): Promise<boolean> 
   } else setStage(id, 'producing', { error: null, failed: null });
   // 2) cast gate and 3) shot building run at the same time: shots only call the shared character definitions, so cast fixes
   //    flow into them automatically. Shot REVIEWS wait until the cast has passed, and re-grab fresh frames first.
+  prerenderStopped.delete(id);   // a fresh or resumed production may render in the background again
   const castP = castGate(id, prev);
   if (!CONFIG.overlapCast && !(await castP)) return false;   // characters are final before any shot is built
   const prod = readJSON<Production>(join(d, 'build', 'production.json')) || {};
@@ -636,24 +637,30 @@ async function castSerial(id: string, prev: Pipeline, firstReview?: Review | nul
 // re-rendering all 732 frames at assembly.
 const prerenderQ = new Map<string, Promise<void>>(), prerenderProcs = new Map<string, Set<ChildProcess>>();
 const PRERENDER_MAX_MS = (seconds: number) => Math.max(10 * 60e3, seconds * 24 * 6e3);   // ~6 s a frame at worst, never under 10 min
-const ASSEMBLY_WAIT_MS = 10 * 60e3;   // assembly waits this long for background renders, then stops them and renders what's missing itself
+const ASSEMBLY_WAIT_MS = +(process.env.PRERENDER_WAIT_MS || 10 * 60e3);   // assembly waits this long for background renders, then stops them and renders what's missing itself
+// Projects whose background renders were stopped: renders already queued behind the stopped one must not start later
+// and write out/frames while assembly renders there too. Cleared when production (re)starts.
+const prerenderStopped = new Set<string>();
+function stopPrerenders(id: string) { prerenderStopped.add(id); for (const p of prerenderProcs.get(id) || []) p.kill(); prerenderQ.delete(id); }
 export async function waitPrerenders(id: string, maxMs = ASSEMBLY_WAIT_MS) {
   const q = prerenderQ.get(id); if (!q) return;
   let timer: NodeJS.Timeout | undefined;
   const late = await Promise.race([q.then(() => false), new Promise<boolean>((r) => { timer = setTimeout(() => r(true), maxMs); })]);
   clearTimeout(timer);
-  if (late) { log(id, { type: 'error', text: `背景渲染超過 ${Math.round(maxMs / 60e3)} 分鐘，先停掉，組裝時補渲` }); for (const p of prerenderProcs.get(id) || []) p.kill(); prerenderQ.delete(id); }
+  if (late) { log(id, { type: 'error', text: `背景渲染超過 ${Math.round(maxMs / 60e3)} 分鐘，先停掉，組裝時補渲` }); stopPrerenders(id); }
 }
 function prerender(id: string, c: Chunk) {
-  const d = dirOf(id), pr = (readJSON<Production>(join(d, 'build', 'production.json')) || {}).prerender as { cwd?: string; cmd?: string } | undefined;
-  if (!pr?.cmd) return;
+  const d = dirOf(id), pr = (readJSON<Production>(join(d, 'build', 'production.json')) || {}).prerender as { cwd?: string; cmd?: string; args?: string[] } | undefined;
+  if (!pr?.cmd && !pr?.args?.length) return;
   type S = { id?: string; start_s?: number; end_s?: number };
   const mine = ((readJSON<Plan>(join(d, 'plan.json'))?.shots || []) as S[]).filter((s) => s.id && c.shots.includes(s.id) && s.start_s != null && s.end_s != null);
   if (!mine.length) return;
   const a = Math.min(...mine.map((s) => s.start_s!)), b = Math.max(...mine.map((s) => s.end_s!));
-  const [bin, ...args] = pr.cmd.replace('{start}', a.toFixed(3)).replace('{end}', b.toFixed(3)).split(/\s+/);
+  // "args": ["node", "render.mjs", …] keeps arguments with spaces intact; "cmd" is split on whitespace
+  const fill = (x: string) => x.replace('{start}', a.toFixed(3)).replace('{end}', b.toFixed(3));
+  const [bin, ...args] = pr.args?.length ? pr.args.map(fill) : fill(pr.cmd!).split(/\s+/);
   const run = () => new Promise<void>((resolve) => {
-    if (load(id).stage === 'error') return resolve();   // cancelled or failed meanwhile
+    if (prerenderStopped.has(id) || load(id).stage === 'error') return resolve();   // stopped, cancelled or failed meanwhile
     log(id, { type: 'tool', name: 'prerender', detail: `${c.id} ${a.toFixed(2)}–${b.toFixed(2)} s: ${bin} ${args.join(' ')}` });
     const t0 = Date.now(), p = spawn(bin, args, { cwd: join(d, pr.cwd || 'build'), env: process.env, stdio: 'ignore' });
     const set = prerenderProcs.get(id) || new Set(); set.add(p); prerenderProcs.set(id, set);
@@ -670,9 +677,9 @@ function prerender(id: string, c: Chunk) {
 const reviewQ = new Map<string, { n: number; wait: (() => void)[] }>();
 async function reviewSlot<T>(id: string, fn: () => Promise<T>): Promise<T> {
   const q = reviewQ.get(id) || { n: 0, wait: [] }; reviewQ.set(id, q);
-  if (q.n >= CONFIG.maxReviews) await new Promise<void>((r) => q.wait.push(r));
-  q.n++;
-  try { return await fn(); } finally { q.n--; q.wait.shift()?.(); }
+  if (q.n >= CONFIG.maxReviews) await new Promise<void>((r) => q.wait.push(r));   // woken with the slot already counted
+  else q.n++;
+  try { return await fn(); } finally { const next = q.wait.shift(); if (next) next(); else q.n--; }
 }
 
 const sharedLocks = new Map<string, Promise<unknown>>();   // per project: one director edits shared files at a time
@@ -732,5 +739,5 @@ export async function accept(id: string) {
   if (await production(id)) await finalPanel(id);
 }
 
-export function cancel(id: string) { for (const ac of running.get(id) || []) ac.abort(); for (const p of prerenderProcs.get(id) || []) p.kill(); }
+export function cancel(id: string) { for (const ac of running.get(id) || []) ac.abort(); stopPrerenders(id); }
 export async function critique(id: string) { return finalPanel(id); }

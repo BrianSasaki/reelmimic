@@ -9,6 +9,7 @@ import type { AgentRun } from './agents/index.ts';
 
 const TMP = mkdtempSync(join(tmpdir(), 'reelmimic-pipe-'));
 process.env.REELMIMIC_PROJECTS = TMP;
+process.env.PRERENDER_WAIT_MS = '2000';   // assembly gives up on a stuck background render after 2 s here
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 // ---------- the fake agent ----------
@@ -209,6 +210,18 @@ describe('production', () => {
     assert.equal(doneAt.length, 2);
     const assemble = ev.findIndex((e) => e.type === 'turn' && e.phase === 'assemble');
     assert.ok(ev.indexOf(doneAt[1]) < assemble, 'assembly started before the background render finished');
+  });
+
+  test('when assembly stops waiting for a stuck background render, renders queued behind it never start', async () => {
+    S = base({ prerender: 'node -e setTimeout(()=>{},20000)' });   // every background render hangs
+    const id = newProject('plan_review');
+    writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, shots: [{ id: 'S1', start_s: 0, end_s: 2 }, { id: 'S2', start_s: 2, end_s: 4 }] }));
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    await new Promise((r) => setTimeout(r, 500));   // give a wrongly queued render time to show up
+    const ev = readFileSync(join(J.dirOf(id), 'logs', 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
+    assert.equal(ev.filter((e) => e.name === 'prerender').length, 1, 'a queued background render started after assembly gave up');
+    assert.ok(ev.some((e) => /背景渲染超過/.test(e.text || '')));
   });
 
   test('shot reviews start while the builder is still working (per-shot watcher)', async () => {

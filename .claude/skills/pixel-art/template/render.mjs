@@ -87,7 +87,7 @@ async function takeSlot() {
     for (let i = 0; i < SLOTS; i++) {
       const f = `${SLOT_DIR}/slot${i}`;
       try { writeFileSync(f, String(process.pid), { flag: 'wx' }); return f; } catch {}
-      try { if (!alive(+readFileSync(f, 'utf8'))) unlinkSync(f); } catch {}
+      try { if (!alive(+readFileSync(f, 'utf8'))) { const t = `${f}.stale${process.pid}`; renameSync(f, t); unlinkSync(t); } } catch {}
     }
     if (waited && waited % 30 === 0) console.log(`waiting for a render slot (${SLOTS} in use machine-wide)…`);
     await new Promise(r => setTimeout(r, 1000));
@@ -103,9 +103,10 @@ try {
 } catch {}
 const slot = await takeSlot();
 process.on('exit', () => { try { unlinkSync(slot); } catch {} });
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(1));
+let browser;
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { try { browser?.process()?.kill(); } catch {} process.exit(1); });
 
-const browser = await puppeteer.launch({
+browser = await puppeteer.launch({
   executablePath: CHROME, headless: true, protocolTimeout: 0,
   args: [...sandbox, '--allow-file-access-from-files', '--ignore-gpu-blocklist', ...gpu, '--enable-gpu-rasterization', '--window-size=1920,1080', '--disable-renderer-backgrounding', '--disable-background-timer-throttling']
 });
