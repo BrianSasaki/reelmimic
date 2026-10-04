@@ -38,7 +38,7 @@ function outputs(prompt: string, dir: string): [string, Record<string, unknown>]
   if (m(/## 步驟：依使用者意見修改企劃/)) return ['replan', { 'plan.json': { title: 'T', version: 3 } }];
   if (m(/## 步驟：製作準備/)) return ['setup', {
     'build/production.json': { chunks: S.chunks, characters: S.chars.map((id) => ({ id, name: id, file: `build/${id}.js`, sheet: `out/check/cast/sheet_${id}.jpg` })) },
-    'out/check/cast/sheet.jpg': 'jpg', ...Object.fromEntries(S.chars.map((id) => [`out/check/cast/sheet_${id}.jpg`, 'jpg'])) }];
+    ...(S.chars.length ? { 'out/check/cast/sheet.jpg': 'jpg' } : {}), ...Object.fromEntries(S.chars.map((id) => [`out/check/cast/sheet_${id}.jpg`, 'jpg'])) }];   // no cast → no sheet
   if (m(/## 步驟：角色關/)) {
     const round = +(m(/第 (\d+) 輪/)?.[1] || 1), ch = m(/結果寫到 out\/check\/cast\/review_(\S+?)\.json/)?.[1];
     const who = ch || (m(/只看並排圖/) ? 'lineup' : 'serial'), ok = S.castPass(who, round);
@@ -257,5 +257,42 @@ describe('pauses', () => {
     assert.deepEqual(calls, ['replan']);
     assert.equal(J.load(id).stage, 'plan_review');
     assert.equal(JSON.parse(readFileSync(join(J.dirOf(id), 'plan.json'), 'utf8')).version, 3);
+  });
+});
+
+describe('no characters', () => {
+  test('a piece with no cast (typography, motion graphics) skips the cast sheet and the cast gate', async () => {
+    S = base({ chars: [] });
+    const id = newProject('plan_review');
+    writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, characters: [] }));
+    await J.approve(id);
+    const j = J.load(id);
+    assert.equal(j.stage, 'done', j.error || '');
+    assert.equal(j.pipeline.cast?.pass, true);
+    assert.ok(!calls.some((c) => c.startsWith('cast_')), calls.join(', '));
+  });
+
+  test('a project already stuck at setup (missing cast sheet) finishes on retry', async () => {
+    S = base({ chars: [] });
+    const id = newProject('error', { failed: 'producing', error: '缺少輸出：out/check/cast/sheet.jpg', pipeline: { phase: 'setup' } });
+    writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, characters: [] }));
+    mkdirSync(join(J.dirOf(id), 'build'), { recursive: true });   // the setup turn itself had succeeded
+    writeFileSync(join(J.dirOf(id), 'build', 'production.json'), JSON.stringify({ chunks: S.chunks, characters: [] }));
+    await J.retry(id);
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
+    assert.ok(!calls.includes('setup') && !calls.some((c) => c.startsWith('cast_')), calls.join(', '));
+  });
+
+  test('a note while paused in the shot line goes to the shots, not to a cast fix', async () => {
+    let s2 = 0;   // S2 fails its first three reviews (the round limit), then passes after the note
+    S = base({ chars: [], shotPass: (shot) => shot !== 'S2' || ++s2 > 3 });
+    const id = newProject('plan_review');
+    writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, characters: [] }));
+    await J.approve(id);
+    assert.equal(J.load(id).stage, 'needs_input');
+    calls = [];
+    await J.message(id, 'make the title bigger');
+    assert.ok(!calls.some((c) => c.startsWith('cast_')), calls.join(', '));
+    assert.equal(J.load(id).stage, 'done', J.load(id).error || '');
   });
 });

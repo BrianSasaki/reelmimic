@@ -375,7 +375,8 @@ export async function message(id: string, text: string, meta: MessageMeta = {}) 
 async function productionNote(id: string, msg: string) {
   const j = load(id), d = dirOf(id), ph = j.pipeline?.phase;
   update(id, (x) => { x.needs = []; x.error = null; x.failed = null; });
-  if (ph === 'cast' || (j.pipeline?.cast && !j.pipeline.cast.pass)) {
+  const cast = (readJSON<Production>(join(d, 'build', 'production.json'))?.characters || []).length > 0;
+  if (cast && (ph === 'cast' || (j.pipeline?.cast && !j.pipeline.cast.pass))) {
     const rv = readJSON<Review>(join(d, 'out', 'check', 'cast', 'review.json')) || {};
     pipe(id, (p) => { p.cast = { round: 0, pass: false, ...p.cast, state: 'fixing' }; });
     if (!(await step(id, 'producing', 'cast_fix', { issues: rv.issues || [], round: 'user', message: msg }, ['out/check/cast/sheet.jpg', 'out/check/cast/fixes.json']))) return;
@@ -411,11 +412,13 @@ export async function approve(id: string) {
 // ---------- production: gates where defects are born ----------
 async function production(id: string, { fresh = false } = {}): Promise<boolean> {
   const d = dirOf(id), prev: Pipeline = fresh ? {} : load(id).pipeline || {};
-  const hasSetup = !fresh && existsSync(join(d, 'build', 'production.json')) && existsSync(join(d, 'out', 'check', 'cast', 'sheet.jpg'));
+  // a piece with no characters (typography, motion graphics) has no cast sheet to make
+  const sheet = (readJSON<Plan>(join(d, 'plan.json'))?.characters || []).length ? ['out/check/cast/sheet.jpg'] : [];
+  const hasSetup = !fresh && [join('build', 'production.json'), ...sheet].every((f) => existsSync(join(d, f)));
   // 1) director: scaffold, shared assets, cast sheets, chunk plan (skipped when resuming)
   if (!hasSetup) {
     pipe(id, (p) => { p.phase = 'setup'; });
-    if (!(await step(id, 'producing', 'setup', {}, ['build/production.json', 'out/check/cast/sheet.jpg']))) return false;
+    if (!(await step(id, 'producing', 'setup', {}, ['build/production.json', ...sheet]))) return false;
   } else setStage(id, 'producing', { error: null, failed: null });
   // 2) cast gate and 3) shot building run at the same time: shots only call the shared character definitions, so cast fixes
   //    flow into them automatically. Shot REVIEWS wait until the cast has passed, and re-grab fresh frames first.
@@ -522,6 +525,7 @@ async function castGate(id: string, prev: Pipeline): Promise<boolean> {
   const files = new Set(chars.map((c) => c.file));
   const parallel = chars.length > 1 && files.size === chars.length && chars.every((c) => existsSync(join(d, c.sheet)));
   if (prev.cast?.pass) return true;
+  if (!(prod.characters || []).length) { pipe(id, (p) => { p.cast = { round: 0, pass: true, state: 'passed' }; }); return true; }   // no cast: nothing to review
   if (!parallel) return castSerial(id, prev);
   const setC = (cid: string, v: Partial<CastCharProgress>) => pipe(id, (p) => { const cast = p.cast!; cast.chars = cast.chars || {}; cast.chars[cid] = { ...(cast.chars[cid] ?? { state: 'queued', round: 0 }), ...v }; });
   const keep: Record<string, CastCharProgress> = prev.cast?.mode === 'parallel' ? prev.cast.chars || {} : {};   // resuming: characters that already passed stay passed

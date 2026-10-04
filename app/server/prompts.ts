@@ -149,6 +149,7 @@ ${ENGINE(p)}
 3. **角色設定圖**：每個角色一張 out/check/cast/sheet_<角色id>.jpg（全解析度）：正面、3/4、側面、5 個以上表情、
    6 個以上本片會用到的動作姿勢（舉手、揮手、拿東西、坐、跑、驚嚇…）。再加一張所有角色並排的 out/check/cast/sheet.jpg（比例、互動姿勢）。
    每張都要有可以重新輸出的指令（寫進 production.json 的 characters[].render）。自己先打開看過。
+   plan.characters 是空的（純字卡、動態圖像這類沒有角色的片）就跳過 2、3：不做設定圖，production.json 的 "characters" 寫 []，不要自己加角色。
 4. 寫 build/production.json：
    { "cast_sheet": "out/check/cast/sheet.jpg",
      "characters": [ { "id": "dou", "name": "豆豆", "file": "build/assets/cast/dou.js", "sheet": "out/check/cast/sheet_dou.jpg", "render": "重新輸出這張設定圖的指令" } ],
