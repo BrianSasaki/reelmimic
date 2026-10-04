@@ -341,8 +341,8 @@ describe('no characters', () => {
   });
 
   test('a note while paused in the shot line goes to the shots, not to a cast fix', async () => {
-    let s2 = 0;   // S2 fails its first three reviews (the round limit), then passes after the note
-    S = base({ chars: [], shotPass: (shot) => shot !== 'S2' || ++s2 > 3 });
+    let s2 = 0;   // S2 fails its first four reviews (the round limit plus the extra round for a single blocker), then passes after the note
+    S = base({ chars: [], shotPass: (shot) => shot !== 'S2' || ++s2 > 4 });
     const id = newProject('plan_review');
     writeFileSync(join(J.dirOf(id), 'plan.json'), JSON.stringify({ title: 'T', version: 1, characters: [] }));
     await J.approve(id);
