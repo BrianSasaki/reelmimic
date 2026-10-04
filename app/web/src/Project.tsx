@@ -34,7 +34,9 @@ export function Project({ id }: { id: string }) {
     let t: ReturnType<typeof setTimeout> | undefined, alive = true;
     const load = () => api.project(id).then((d) => { if (alive) { setS(d as SnapshotView); setV((x) => x + 1); } }).catch(() => {});
     load();
-    const off = api.events(id, () => { clearTimeout(t); t = setTimeout(load, 350); });
+    // also reload when the stream (re)opens: whatever changed while it was down (a restart marking the job interrupted) arrives no other way
+    const soon = () => { clearTimeout(t); t = setTimeout(load, 350); };
+    const off = api.events(id, soon, soon);
     return () => { alive = false; off(); clearTimeout(t); };
   }, [id]);
   useEffect(() => { const k = (e: KeyboardEvent) => e.key === 'Escape' && setZoom(null); addEventListener('keydown', k); return () => removeEventListener('keydown', k); }, []);

@@ -108,6 +108,7 @@ app.post('/api/projects/:id/cancel', (req, res) => { if (guard(res, req.params.i
 app.get('/api/projects/:id/events', (req, res) => {
   const { id } = req.params; if (!guard(res, id)) return;
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.flushHeaders();   // send them now, not with the first event or ping: the browser's 'open' (the UI reloads on it) waits for them
   const send = (jid: string, ev: J.BusEvent) => { if (jid === id) res.write(`data: ${JSON.stringify(ev.type === 'job' ? { type: 'job', stage: ev.job.stage } : ev)}\n\n`); };
   J.bus.on('job', send);
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
