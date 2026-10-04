@@ -131,6 +131,7 @@ committed. See [`secrets.example.json`](secrets.example.json) for the format.
 | `CODEX_SANDBOX` | Codex sandbox mode (default `danger-full-access`, like Claude Code with Bash allowed; `workspace-write` blocks the Chrome renderer) |
 | `BUILDERS`, `MAX_AGENTS` | How many agents work on one video at once (default 6), and the limit across all projects (default 12) |
 | `PORT` | Web port (default 4318) |
+| `REELMIMIC_SECRETS` | Path to a different secrets file (legacy: `CLONE_STUDIO_SECRETS`) |
 | `UPLOAD_POST_KEY`, `UPLOAD_POST_USER` | Optional. Post a finished video to TikTok, Instagram, YouTube and others with `npm run post-video` (see below); `UPLOAD_POST_API` overrides the API address |
 
 ### Posting the finished video (optional)
